@@ -1,26 +1,31 @@
-﻿module BABYLON {
+module BABYLON {
     export class RenderingGroup {
         private _scene: Scene;
         private _opaqueSubMeshes = new SmartArray<SubMesh>(256);
         private _transparentSubMeshes = new SmartArray<SubMesh>(256);
         private _alphaTestSubMeshes = new SmartArray<SubMesh>(256);
         private _particleSystems = new SmartArray<ParticleSystem>(256);
-        private _spriteManagers = new SmartArray<SpriteManager>(256);        
+        private _spriteManagers = new SmartArray<SpriteManager>(256);
         private _activeVertices: number;
 
         private _opaqueSortCompareFn: (a: SubMesh, b: SubMesh) => number;
         private _alphaTestSortCompareFn: (a: SubMesh, b: SubMesh) => number;
         private _transparentSortCompareFn: (a: SubMesh, b: SubMesh) => number;
-        
+
         private _renderOpaque: (subMeshes: SmartArray<SubMesh>) => void;
         private _renderAlphaTest: (subMeshes: SmartArray<SubMesh>) => void;
         private _renderTransparent: (subMeshes: SmartArray<SubMesh>) => void;
 
         public onBeforeTransparentRendering: () => void;
 
+        // oclusion query
+        private _vertexBuffers: { [key: string]: VertexBuffer } = {};
+        private _indexBuffer: WebGLBuffer;
+        private _colorShader: ShaderMaterial;
+
         /**
          * Set the opaque sort comparison function.
-         * If null the sub meshes will be render in the order they were created 
+         * If null the sub meshes will be render in the order they were created
          */
         public set opaqueSortCompareFn(value: (a: SubMesh, b: SubMesh) => number) {
             this._opaqueSortCompareFn = value;
@@ -34,7 +39,7 @@
 
         /**
          * Set the alpha test sort comparison function.
-         * If null the sub meshes will be render in the order they were created 
+         * If null the sub meshes will be render in the order they were created
          */
         public set alphaTestSortCompareFn(value: (a: SubMesh, b: SubMesh) => number) {
             this._alphaTestSortCompareFn = value;
@@ -48,7 +53,7 @@
 
         /**
          * Set the transparent sort comparison function.
-         * If null the sub meshes will be render in the order they were created 
+         * If null the sub meshes will be render in the order they were created
          */
         public set transparentSortCompareFn(value: (a: SubMesh, b: SubMesh) => number) {
             if (value) {
@@ -75,7 +80,7 @@
 
             this.opaqueSortCompareFn = opaqueSortCompareFn;
             this.alphaTestSortCompareFn = alphaTestSortCompareFn;
-            this.transparentSortCompareFn = transparentSortCompareFn;            
+            this.transparentSortCompareFn = transparentSortCompareFn;
         }
 
         /**
@@ -90,10 +95,11 @@
             }
 
             var engine = this._scene.getEngine();
-            
+
             // Opaque
             if (this._opaqueSubMeshes.length !== 0) {
-                this._renderOpaque(this._opaqueSubMeshes);
+                //this._renderOpaque(this._opaqueSubMeshes);
+                this._renderOcclusionQuery(this._opaqueSubMeshes, this._scene.activeCamera.globalPosition);
             }
 
             // Alpha test
@@ -109,7 +115,7 @@
             if (renderSprites) {
                 this._renderSprites();
             }
-            
+
             // Particles
             if (renderParticles) {
                 this._renderParticles(activeMeshes);
@@ -187,10 +193,87 @@
             }
         }
 
+        private _renderOcclusionQuery(subMeshes: SmartArray<SubMesh>, cameraPosition: Vector3): void {
+            if (subMeshes.length === 0) {
+                return;
+            }
+            var engine = this._scene.getEngine();
+
+            subMeshes.forEach(function (subMesh) {
+                subMesh._distanceToCamera = subMesh.getBoundingInfo().boundingSphere.centerWorld.subtract(this._scene.activeCamera.position).length();
+            }.bind(this));
+            var sm = subMeshes.data.slice(0).sort(RenderingGroup.frontToBackSortCompare);
+
+            if (!this._colorShader) {
+              this._colorShader = new ShaderMaterial("colorShader", this._scene, "color",
+                  {
+                      attributes: [VertexBuffer.PositionKind],
+                      uniforms: ["worldViewProjection", "color"]
+                  });
+
+
+              var boxdata = VertexData.CreateBox(1.0);
+              this._vertexBuffers[VertexBuffer.PositionKind] = new VertexBuffer(engine, boxdata.positions, VertexBuffer.PositionKind, false);
+              this._indexBuffer = engine.createIndexBuffer(boxdata.indices);
+            }
+
+            if (!this._colorShader.isReady()) {
+                return;
+            }
+
+            engine.setDepthWrite(false);
+            this._colorShader._preBind();
+
+            var tick = function(sm, gl, query){
+                if(!engine._gl.getQueryParameter(query,engine._gl.QUERY_RESULT_AVAILABLE)){
+                    requestAnimationFrame(function () {tick(sm, gl, query)});
+                    return;
+                }
+
+                var result = engine._gl.getQueryParameter(query,engine._gl.QUERY_RESULT);
+                console.log(Number(result) + " " + sm._mesh.name);
+                engine._gl.deleteQuery(query);
+            }
+
+            for (var boundingBoxIndex = 0; boundingBoxIndex < subMeshes.length; boundingBoxIndex++) {
+                sm[boundingBoxIndex].refreshBoundingInfo();
+                var boundingBox = sm[boundingBoxIndex].getBoundingInfo().boundingBox;
+                var min = boundingBox.minimum;
+                var max = boundingBox.maximum;
+                var diff = max.subtract(min);
+                var median = min.add(diff.scale(0.5));
+
+                var worldMatrix = Matrix.Scaling(diff.x, diff.y, diff.z)
+                    .multiply(Matrix.Translation(median.x, median.y, median.z))
+                    .multiply(boundingBox.getWorldMatrix());
+
+                // VBOs
+                engine.bindBuffers(this._vertexBuffers, this._indexBuffer, this._colorShader.getEffect());
+
+                // Front
+                engine.setDepthFunctionToLess();
+                this._scene.resetCachedMaterial();
+                this._colorShader.bind(worldMatrix);
+                this._colorShader.setColor4("color", BABYLON.Color4.FromArray([0, 0, 0, 0]));
+
+                // Draw order
+                var query = engine._gl.createQuery();
+                engine._gl.beginQuery(engine._gl.ANY_SAMPLES_PASSED, query);
+                engine._gl.drawElements(engine._gl.TRIANGLES, 36, engine._uintIndicesCurrentlySet ? engine._gl.UNSIGNED_INT : engine._gl.UNSIGNED_SHORT, 0);
+                engine._gl.endQuery(engine._gl.ANY_SAMPLES_PASSED);
+
+                tick(sm[boundingBoxIndex], engine._gl, query);
+            }
+
+            this._colorShader.unbind();
+            engine.setDepthFunctionToLessOrEqual();
+            engine.setDepthWrite(true);
+        }
+
         /**
          * Build in function which can be applied to ensure meshes of a special queue (opaque, alpha test, transparent)
          * are rendered back to front if in the same alpha index.
-         * 
+         *
          * @param a The first submesh
          * @param b The second submesh
          * @returns The result of the comparison
@@ -211,7 +294,7 @@
         /**
          * Build in function which can be applied to ensure meshes of a special queue (opaque, alpha test, transparent)
          * are rendered back to front.
-         * 
+         *
          * @param a The first submesh
          * @param b The second submesh
          * @returns The result of the comparison
@@ -231,7 +314,7 @@
         /**
          * Build in function which can be applied to ensure meshes of a special queue (opaque, alpha test, transparent)
          * are rendered front to back (prevent overdraw).
-         * 
+         *
          * @param a The first submesh
          * @param b The second submesh
          * @returns The result of the comparison
@@ -318,7 +401,7 @@
                 return;
             }
 
-            // Sprites       
+            // Sprites
             var activeCamera = this._scene.activeCamera;
             this._scene._spritesDuration.beginMonitoring();
             for (var id = 0; id < this._spriteManagers.length; id++) {
@@ -331,4 +414,4 @@
             this._scene._spritesDuration.endMonitoring(false);
         }
     }
-} 
+}
